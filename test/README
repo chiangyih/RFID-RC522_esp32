@@ -1,0 +1,27 @@
+本資料夾用於放置本專案測試程式。
+
+目前尚未建立自動化測試，建議優先補下列案例：
+
+1. UID 轉換測試
+驗證 4-byte、7-byte、10-byte UID 的 HEX 與 DEC 輸出是否正確。
+
+2. 顯示邏輯測試 (整合測試)
+確認刷卡後畫面保留，刷下一張卡才更新。
+
+3. 邊界條件測試
+確認空感應、快速連續刷卡、長時間執行不異常。
+
+建議測試檔命名：
+
+test/
+|- test_uid_codec/
+|  |- test_main.cpp
+|- test_display_flow/
+|  |- test_main.cpp
+
+執行測試：
+
+pio test
+
+如需了解 PlatformIO 測試框架：
+https://docs.platformio.org/en/latest/advanced/unit-testing/index.html

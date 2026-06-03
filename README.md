@@ -1,0 +1,230 @@
+# RFID RC522 UID 讀取專案
+
+本專案使用 ESP32 (NodeMCU-32S) 搭配 RC522 RFID 讀卡模組，讀取卡片 UID 後，同步輸出到 Serial 與 1.3 吋 SH1106 OLED。
+
+重點行為如下：
+
+1. OLED 顯示 HEX 與 DEC(Big Endian) 兩種 UID 格式。
+2. 卡片拿開後畫面保留，不會自動清空。
+3. 感應到下一張卡片時，才更新畫面內容。
+4. DEC 轉換支援 10-byte UID，不會因 64 位整數上限而溢位。
+
+---
+
+## 硬體元件
+
+| 元件 | 型號 | 介面 |
+|---|---|---|
+| 微控制器 | ESP32 NodeMCU-32S | - |
+| RFID 讀卡模組 | MFRC522 (RC522) | SPI (VSPI) |
+| OLED 顯示器 | 1.3" SH1106 128x64 | I2C |
+
+---
+
+## 接腳對應表
+
+### RC522 -> ESP32
+
+| RC522 腳位 | ESP32 GPIO | 說明 |
+|---|---|---|
+| SDA (SS) | GPIO 5 | SPI 片選 |
+| SCK | GPIO 18 | SPI 時脈 (VSPI) |
+| MOSI | GPIO 23 | SPI 主出從入 (VSPI) |
+| MISO | GPIO 19 | SPI 主入從出 (VSPI) |
+| RST | GPIO 4 | 模組重置 |
+| IRQ | 不連接 | 中斷 (本專案未使用) |
+| 3.3V | 3.3V | 電源 (請勿接 5V) |
+| GND | GND | 接地 |
+
+### SH1106 OLED -> ESP32
+
+| OLED 腳位 | ESP32 GPIO | 說明 |
+|---|---|---|
+| SCL | GPIO 22 | I2C 時脈 |
+| SDA | GPIO 21 | I2C 資料 |
+| VCC | 3.3V | 電源 |
+| GND | GND | 接地 |
+
+I2C 位址通常是 0x3C，部分模組是 0x3D。
+
+---
+
+## 接線示意圖
+
+```text
+ESP32 NodeMCU-32S
+┌───────────────────────────────┐
+│ GPIO5  ─────── SDA (SS)       │◄── RC522
+│ GPIO18 ─────── SCK            │◄── RC522
+│ GPIO23 ─────── MOSI           │◄── RC522
+│ GPIO19 ─────── MISO           │◄── RC522
+│ GPIO4  ─────── RST            │◄── RC522
+│ 3.3V   ─────── 3.3V           │◄── RC522 & OLED
+│ GND    ─────── GND            │◄── RC522 & OLED
+│                               │
+│ GPIO22 ─────── SCL            │◄── OLED SH1106
+│ GPIO21 ─────── SDA            │◄── OLED SH1106
+└───────────────────────────────┘
+```
+
+---
+
+## 顯示與輸出行為
+
+### 待機畫面
+
+```text
+RFID Reader
+Waiting...
+```
+
+### 偵測到卡片時
+
+```text
+HEX:
+A3 F2 01 5B
+DEC:(Big Endian)
+2751234395
+----------------
+Wait another card:...
+```
+
+卡片移開後，畫面保持最後一次資料；直到刷下一張卡才更新。
+
+### Serial 輸出格式 (115200)
+
+```text
+Card detected!
+UID HEX: A3 F2 01 5B
+UID DEC:(Big Endian) 2751234395
+```
+
+---
+
+## 詳細程式架構與邏輯說明
+
+### 模組分工
+
+1. RFID 讀卡層
+使用 MFRC522 函式庫負責卡片偵測與 UID 讀取。
+核心 API：PICC_IsNewCardPresent、PICC_ReadCardSerial、PICC_HaltA、PCD_StopCrypto1。
+
+2. 顯示層
+使用 U8g2 的全緩衝模式，每次重新繪製完整畫面再送出。
+核心 API：clearBuffer、drawStr、drawHLine、sendBuffer。
+
+3. 資料格式層
+將 UID 同步轉成兩種字串：
+HEX 字串：每個 byte 轉為兩位大寫十六進制，byte 間用空白分隔。
+DEC 字串：以大整數十進制位數陣列運算，支援 10-byte UID。
+
+### 主流程 (setup 與 loop)
+
+```mermaid
+flowchart TD
+	A[setup 啟動] --> B[初始化 Serial]
+	B --> C[初始化 SPI]
+	C --> D[初始化 RC522]
+	D --> E[初始化 OLED]
+	E --> F[顯示 Waiting]
+	F --> G[進入 loop]
+
+	G --> H{有新卡且讀卡成功?}
+	H -- 否 --> G
+	H -- 是 --> I[UID 轉 HEX 與 DEC]
+	I --> J[輸出到 Serial]
+	J --> K[顯示到 OLED]
+	K --> L[HaltA]
+	L --> M[StopCrypto1]
+	M --> G
+```
+
+### DEC(Big Endian) 演算法
+
+UID 位元組序列視為大端序整數：
+
+$$
+V = (((b_0 \times 256 + b_1) \times 256 + b_2) \times \cdots ) + b_n
+$$
+
+為避免 10-byte UID 超出 64 位整數，程式使用十進制位數陣列儲存結果。
+每處理一個新 byte，就做一次：
+
+$$
+result = result \times 256 + byte
+$$
+
+最後把位數陣列反向輸出成字串，得到完整十進制結果。
+
+### 關鍵函式說明
+
+1. showWaiting
+顯示開機待機畫面。
+
+2. showUID
+渲染 HEX/DEC 與底部等待提示。
+每次先清空緩衝區，確保刷新卡時覆蓋舊畫面。
+
+3. uidToHexCString
+以 snprintf 逐段填入固定緩衝區，避免動態記憶體配置。
+
+4. uidToDecCString
+以十進制位數陣列處理大整數，避免 64-bit 溢位。
+
+---
+
+## 函式庫相依套件
+
+| 函式庫 | PlatformIO 名稱 | 用途 |
+|---|---|---|
+| MFRC522 | miguelbalboa/MFRC522 | RC522 RFID 驅動 |
+| U8g2 | olikraus/U8g2 | SH1106 OLED 驅動 |
+
+---
+
+## 開發環境
+
+1. IDE: Visual Studio Code + PlatformIO
+2. 平台: Espressif32
+3. 框架: Arduino
+4. 開發板: NodeMCU-32S
+
+### 建構與燒錄
+
+```bash
+# 編譯
+pio run
+
+# 編譯並燒錄
+pio run --target upload
+
+# 開啟 Serial Monitor
+pio device monitor --baud 115200
+```
+
+---
+
+## 注意事項
+
+1. RC522 與 OLED 都使用 3.3V。
+2. 若 OLED 無顯示，請先檢查 I2C 位址 (0x3C/0x3D)。
+3. 本專案顯示策略為資料保留式，不會在讀卡後自動回待機。
+4. DEC 轉換已支援 10-byte UID；若未來改用更長 UID，需同步放大位數與緩衝區。
+
+---
+
+## 專案結構
+
+```text
+RFID-RC522_esp32/
+├── src/
+│   └── main.cpp           # 主程式 (讀卡、轉換、顯示)
+├── include/
+│   └── README             # 標頭檔放置說明
+├── lib/
+│   └── README             # 專案私有函式庫說明
+├── test/
+│   └── README             # 測試規劃與建議
+├── platformio.ini         # PlatformIO 設定
+└── README.md              # 專案總說明
+```

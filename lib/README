@@ -1,0 +1,29 @@
+本資料夾用於放置本專案私有函式庫。
+
+目前專案仍為單檔主程式 (src/main.cpp)；
+若後續功能增加，建議拆分為下列私有函式庫：
+
+1. lib/rfid_service
+負責 RC522 偵測、讀卡、停止交易流程。
+
+2. lib/display_service
+負責 OLED 畫面排版、待機畫面與資料畫面渲染。
+
+3. lib/uid_codec
+負責 UID HEX/DEC 轉換，包含 10-byte UID 十進制演算法。
+
+建議結構：
+
+lib/
+|- uid_codec/
+|  |- src/
+|  |  |- uid_codec.cpp
+|  |- include/
+|     |- uid_codec.h
+|- display_service/
+|  |- src/
+|  |  |- display_service.cpp
+|  |- include/
+|     |- display_service.h
+
+PlatformIO 會自動掃描與連結本資料夾內的相依程式碼。

@@ -1,0 +1,22 @@
+本資料夾用於放置本專案的標頭檔。
+
+目前專案邏輯集中在 src/main.cpp，尚未拆分為多個模組；
+若後續擴充建議將下列宣告搬到標頭檔：
+
+1. RFID/OLED 介面封裝函式宣告
+2. UID 轉換工具函式宣告
+3. 共同常數與設定
+
+建議命名方式：
+
+1. .h 或 .hpp 皆可，但請統一風格
+2. 需加入 include guard 或 #pragma once
+
+建議目錄範例：
+
+include/
+|- display.h
+|- rfid_reader.h
+|- uid_convert.h
+
+此專案使用 PlatformIO，編譯時會自動納入 include 路徑。
