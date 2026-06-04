@@ -13,7 +13,7 @@
 // 專案邏輯總覽
 // --------------------------------------------------------------
 // [資料流]
-// RC522 讀卡 -> UID 轉碼 (HEX/DEC) -> Serial/OLED 同步輸出
+// RC522 讀卡 -> UID 轉碼 (HEX/DEC) -> Serial/OLED 顯示 -> 事件入佇列 -> 背景上傳 Google Sheet
 //
 // [顯示策略]
 // 1) 開機先顯示待機畫面。
@@ -24,6 +24,8 @@
 // [效能策略]
 // 1) 使用固定緩衝區，避免 String 動態配置。
 // 2) HEX/DEC 字串在 loop 內只計算一次，供 Serial 與 OLED 共用。
+// 3) 上傳採佇列與重試，減少網路波動對刷卡反應速度的影響。
+// 4) 同 UID 短時間去抖動，避免重複感應造成重複寫入與畫面閃動。
 // ============================================================== 
 
 // ── RC522 接腳定義 ──────────────────────────────────────────
@@ -52,10 +54,44 @@ static const size_t UID_DEC_BUF_LEN = 26;
 static const size_t JSON_PAYLOAD_LEN = 192;
 // 上傳除錯輸出開關：true 顯示 redirect 與額外診斷，false 僅保留必要資訊。
 static const bool SHEET_UPLOAD_DEBUG = false;
+// 上傳佇列大小（避免讀卡流程被網路延遲阻塞）。
+static const uint8_t UPLOAD_QUEUE_CAPACITY = 8;
+// 上傳失敗重試次數（不含第一次）。
+static const uint8_t UPLOAD_MAX_RETRY = 2;
+// 重試等待毫秒數。
+static const uint32_t UPLOAD_RETRY_DELAY_MS = 1500;
+// HTTP 連線/回應逾時。
+static const uint16_t HTTP_CONNECT_TIMEOUT_MS = 1500;
+static const uint16_t HTTP_READ_TIMEOUT_MS = 2500;
+// 同一張卡短時間重複感應去抖（避免重複處理）。
+static const uint32_t UID_DEBOUNCE_MS = 350;
 
 // NTP 設定（台灣時區 UTC+8）。
 static const long GMT_OFFSET_SEC = 8 * 3600;
 static const int DST_OFFSET_SEC  = 0;
+
+struct UploadItem {
+    // 產生事件當下的本地時間字串（已格式化）。
+    char dateTime[32];
+    // UID HEX（原始值，如 "08 CF E7 42"）。
+    char uidHex[UID_HEX_BUF_LEN];
+    // UID DEC（大端序十進制值）。
+    char uidDec[UID_DEC_BUF_LEN];
+    // 當前已重試次數。
+    uint8_t retryCount;
+    // 下一次允許重試的時間點（millis）。
+    uint32_t nextRetryAt;
+};
+
+// 環形佇列：head 指向待送首筆，tail 指向下一個可寫入位置。
+static UploadItem uploadQueue[UPLOAD_QUEUE_CAPACITY];
+static uint8_t uploadHead = 0;
+static uint8_t uploadTail = 0;
+static uint8_t uploadCount = 0;
+
+// 去抖動狀態：記住最近一次 UID 與時間，抑制過快重複觸發。
+static char lastUidHex[UID_HEX_BUF_LEN] = {0};
+static uint32_t lastUidReadAt = 0;
 
 // ── 函式宣告 ────────────────────────────────────────────────
 // showWaiting()：顯示開機待機畫面。
@@ -70,7 +106,9 @@ void uidToDecCString(const MFRC522::Uid &uid, char *out, size_t outSize);
 void connectWiFi();
 void syncTimeByNTP();
 void getCurrentDateTime(char *out, size_t outSize);
-void uploadUIDToSheet(const char *hexStr, const char *decStr);
+bool uploadUIDToSheet(const char *dateTimeStr, const char *hexStr, const char *decStr);
+void enqueueUpload(const char *hexStr, const char *decStr);
+void processUploadQueue();
 
 // ════════════════════════════════════════════════════════════
 void setup() {
@@ -168,21 +206,18 @@ void getCurrentDateTime(char *out, size_t outSize) {
 }
 
 // ────────────────────────────────────────────────────────────
-// 每次讀到 UID 後發送到 Google Apps Script Webhook。
+// 單次上傳執行器：嘗試將一筆資料送到 Google Apps Script Webhook。
 // 欄位：datetime、uid_raw、uid_big_endian。
-void uploadUIDToSheet(const char *hexStr, const char *decStr) {
+// 回傳值：true=本次送達成功(2xx)，false=失敗（可交由佇列重試）。
+bool uploadUIDToSheet(const char *dateTimeStr, const char *hexStr, const char *decStr) {
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Sheet upload skipped: WiFi disconnected.");
-        return;
+        return false;
     }
 
     if (strlen(SHEET_WEBHOOK_URL) == 0 || strstr(SHEET_WEBHOOK_URL, "replace-me") != nullptr) {
         Serial.println("Sheet upload skipped: SHEET_WEBHOOK_URL not configured.");
-        return;
+        return false;
     }
-
-    char dateTimeStr[32];
-    getCurrentDateTime(dateTimeStr, sizeof(dateTimeStr));
 
     char payload[JSON_PAYLOAD_LEN];
     snprintf(
@@ -200,18 +235,21 @@ void uploadUIDToSheet(const char *hexStr, const char *decStr) {
     HTTPClient http;
     if (!http.begin(client, SHEET_WEBHOOK_URL)) {
         Serial.println("Sheet upload failed: begin() failed.");
-        return;
+        return false;
     }
+    http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+    http.setTimeout(HTTP_READ_TIMEOUT_MS);
 
-    // Google Apps Script 可能回傳 30x。
-    // 301/302/303 依慣例改用 GET；307/308 才保留原方法（POST）。
+    // Google Apps Script 可能先回 30x。
+    // 301/302/303 依常見行為改為 GET；307/308 才保留原 POST。
+    // 為了正確判讀流程，會分別記錄 initial 與 follow 狀態碼。
     const char *headerKeys[] = {"Location"};
     http.collectHeaders(headerKeys, 1);
 
     http.addHeader("Content-Type", "application/json");
-    int httpCode = http.POST(reinterpret_cast<uint8_t *>(payload), strlen(payload));
+    int initialHttpCode = http.POST(reinterpret_cast<uint8_t *>(payload), strlen(payload));
 
-    if (httpCode == 301 || httpCode == 302 || httpCode == 303 || httpCode == 307 || httpCode == 308) {
+    if (initialHttpCode == 301 || initialHttpCode == 302 || initialHttpCode == 303 || initialHttpCode == 307 || initialHttpCode == 308) {
         String redirectUrl = http.header("Location");
         if (SHEET_UPLOAD_DEBUG) {
             Serial.print("Sheet redirect to: ");
@@ -227,20 +265,25 @@ void uploadUIDToSheet(const char *hexStr, const char *decStr) {
             HTTPClient redirectedHttp;
             if (!redirectedHttp.begin(redirectedClient, redirectUrl)) {
                 Serial.println("Sheet upload failed: redirect begin() failed.");
-                return;
+                return false;
             }
+            redirectedHttp.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+            redirectedHttp.setTimeout(HTTP_READ_TIMEOUT_MS);
 
-            if (httpCode == 307 || httpCode == 308) {
+            int followHttpCode = 0;
+            if (initialHttpCode == 307 || initialHttpCode == 308) {
                 redirectedHttp.addHeader("Content-Type", "application/json");
-                httpCode = redirectedHttp.POST(reinterpret_cast<uint8_t *>(payload), strlen(payload));
+                followHttpCode = redirectedHttp.POST(reinterpret_cast<uint8_t *>(payload), strlen(payload));
             } else {
-                httpCode = redirectedHttp.GET();
+                followHttpCode = redirectedHttp.GET();
             }
 
-            if (httpCode > 0) {
+            if (followHttpCode > 0) {
                 Serial.print("Sheet upload HTTP code: ");
-                Serial.println(httpCode);
-                if (httpCode < 200 || httpCode >= 300) {
+                Serial.print(initialHttpCode);
+                Serial.print(" -> ");
+                Serial.println(followHttpCode);
+                if (followHttpCode < 200 || followHttpCode >= 300) {
                     String response = redirectedHttp.getString();
                     response.replace('\n', ' ');
                     if (response.length() > 180) {
@@ -251,18 +294,23 @@ void uploadUIDToSheet(const char *hexStr, const char *decStr) {
                 }
             } else {
                 Serial.print("Sheet upload failed: ");
-                Serial.println(redirectedHttp.errorToString(httpCode));
+                Serial.print("initial=");
+                Serial.print(initialHttpCode);
+                Serial.print(", follow=");
+                Serial.println(redirectedHttp.errorToString(followHttpCode));
             }
 
             redirectedHttp.end();
-            return;
+            return (followHttpCode >= 200 && followHttpCode < 300);
         }
+
+        return false;
     }
 
-    if (httpCode > 0) {
+    if (initialHttpCode > 0) {
         Serial.print("Sheet upload HTTP code: ");
-        Serial.println(httpCode);
-        if (httpCode < 200 || httpCode >= 300) {
+        Serial.println(initialHttpCode);
+        if (initialHttpCode < 200 || initialHttpCode >= 300) {
             String response = http.getString();
             response.replace('\n', ' ');
             if (response.length() > 180) {
@@ -273,14 +321,77 @@ void uploadUIDToSheet(const char *hexStr, const char *decStr) {
         }
     } else {
         Serial.print("Sheet upload failed: ");
-        Serial.println(http.errorToString(httpCode));
+        Serial.println(http.errorToString(initialHttpCode));
     }
 
     http.end();
+    return (initialHttpCode >= 200 && initialHttpCode < 300);
+}
+
+// ────────────────────────────────────────────────────────────
+// 將 UID 讀取事件加入上傳佇列，避免當前刷卡流程被網路請求阻塞。
+void enqueueUpload(const char *hexStr, const char *decStr) {
+    if (uploadCount >= UPLOAD_QUEUE_CAPACITY) {
+        // 佇列滿時丟棄最舊資料，保留最新刷卡事件。
+        uploadHead = (uploadHead + 1) % UPLOAD_QUEUE_CAPACITY;
+        uploadCount--;
+        if (SHEET_UPLOAD_DEBUG) {
+            Serial.println("Sheet queue full, drop oldest item.");
+        }
+    }
+
+    UploadItem &item = uploadQueue[uploadTail];
+    getCurrentDateTime(item.dateTime, sizeof(item.dateTime));
+    strncpy(item.uidHex, hexStr, sizeof(item.uidHex) - 1);
+    item.uidHex[sizeof(item.uidHex) - 1] = '\0';
+    strncpy(item.uidDec, decStr, sizeof(item.uidDec) - 1);
+    item.uidDec[sizeof(item.uidDec) - 1] = '\0';
+    item.retryCount = 0;
+    item.nextRetryAt = 0;
+
+    uploadTail = (uploadTail + 1) % UPLOAD_QUEUE_CAPACITY;
+    uploadCount++;
+}
+
+// ────────────────────────────────────────────────────────────
+// 逐筆處理上傳佇列：成功即出列，失敗則按次數重試。
+void processUploadQueue() {
+    if (uploadCount == 0) {
+        return;
+    }
+
+    UploadItem &item = uploadQueue[uploadHead];
+    if (item.nextRetryAt != 0 && static_cast<int32_t>(millis() - item.nextRetryAt) < 0) {
+        return;
+    }
+
+    const bool success = uploadUIDToSheet(item.dateTime, item.uidHex, item.uidDec);
+    if (success) {
+        uploadHead = (uploadHead + 1) % UPLOAD_QUEUE_CAPACITY;
+        uploadCount--;
+        return;
+    }
+
+    if (item.retryCount < UPLOAD_MAX_RETRY) {
+        item.retryCount++;
+        item.nextRetryAt = millis() + UPLOAD_RETRY_DELAY_MS;
+        if (SHEET_UPLOAD_DEBUG) {
+            Serial.print("Sheet retry queued, attempt: ");
+            Serial.println(item.retryCount);
+        }
+    } else {
+        Serial.println("Sheet upload dropped after retries.");
+        uploadHead = (uploadHead + 1) % UPLOAD_QUEUE_CAPACITY;
+        uploadCount--;
+    }
 }
 
 // ════════════════════════════════════════════════════════════
 void loop() {
+    // 非阻塞背景上傳：即使當前沒有刷卡，也持續嘗試送出佇列資料。
+    // 這可把網路延遲從「讀卡主路徑」抽離，減少刷卡時卡頓。
+    processUploadQueue();
+
     // 流程說明：
     // 1) PICC_IsNewCardPresent()：檢查是否有「新卡」進入天線範圍。
     // 2) PICC_ReadCardSerial()：若有卡，再嘗試讀取 UID。
@@ -296,6 +407,20 @@ void loop() {
     uidToHexCString(rfid.uid, hexStr, sizeof(hexStr));
     uidToDecCString(rfid.uid, decStr, sizeof(decStr));
 
+    const uint32_t nowMs = millis();
+    // 去抖動：同一 UID 在極短時間內重複觸發時，直接跳過後續流程。
+    // 目的：
+    // 1) 降低同卡停留在天線區時的重複顯示與重複上傳
+    // 2) 提升高頻刷卡時的有效吞吐
+    if (strcmp(hexStr, lastUidHex) == 0 && (nowMs - lastUidReadAt) < UID_DEBOUNCE_MS) {
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
+        return;
+    }
+    strncpy(lastUidHex, hexStr, sizeof(lastUidHex) - 1);
+    lastUidHex[sizeof(lastUidHex) - 1] = '\0';
+    lastUidReadAt = nowMs;
+
     // Serial 輸出：提供開發/除錯時觀察資料。
     Serial.println("Card detected!");
     Serial.print("UID HEX: "); Serial.println(hexStr);
@@ -305,8 +430,8 @@ void loop() {
     // showUID() 內部會先 clearBuffer()，因此每次新卡都會覆蓋舊資訊。
     showUID(hexStr, decStr);
 
-    // 將每一筆 UID 讀取結果上傳至 Google Sheet。
-    uploadUIDToSheet(hexStr, decStr);
+    // 將每一筆 UID 讀取結果放入上傳佇列（立即返回，不阻塞感應流程）。
+    enqueueUpload(hexStr, decStr);
 
     // 讓目前卡片進入 Halt，結束本次交易流程，避免重複觸發。
     rfid.PICC_HaltA();

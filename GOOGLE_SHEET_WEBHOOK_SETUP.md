@@ -2,6 +2,12 @@
 
 本文件說明如何建立 `SHEET_WEBHOOK_URL`，並完成從 ESP32 到 Google Sheet 的資料寫入流程。
 
+目前韌體版本已最佳化為：
+
+- 讀卡後先更新 OLED，再將上傳事件放入背景佇列。
+- 佇列會背景送出，不阻塞主讀卡流程。
+- 上傳失敗會重試（預設 2 次），同 UID 短時間會去抖動。
+
 ## 1. 目標與前置條件
 
 ### 1.1 目標
@@ -124,8 +130,10 @@ function doPost(e) {
 3. 刷一張卡，應看到：
    - UID HEX
    - UID DEC
-   - `Sheet upload HTTP code: 200`（或其他 2xx）
+  - `Sheet upload HTTP code: 200`（或其他 2xx）
+  - 若有轉址，可能顯示 `Sheet upload HTTP code: 302 -> 200`
   - 若不是 2xx，會多看到 `Sheet upload response: ...` 伺服器回應片段
+  - `Sheet redirect to: ...` 預設不顯示（僅 `SHEET_UPLOAD_DEBUG = true` 時顯示）
 4. 回到 Google Sheet，確認有新增一列資料。
 
 ### 6.1 重要檢查（避免 302/500）
@@ -134,6 +142,7 @@ function doPost(e) {
 2. 確認 `SHEET_WEBHOOK_URL` 使用 `/exec`，不要用 `/dev`。
 3. 每次修改 Apps Script 程式碼後，需重新部署 Web App 版本。
 4. 若不想序列埠過多訊息，可維持 `SHEET_UPLOAD_DEBUG = false`（預設）。
+5. 背景佇列會持續送出資料，短暫斷網恢復後可自動重試送達。
 
 ## 7. 端到端測試建議
 
@@ -212,6 +221,16 @@ function doPost(e) {
 - 檢查 `include/secrets.h` 的 URL
 - 先用瀏覽器或 Postman 測試 webhook 是否可達
 
+### 問題 6：快速刷卡時發現有少量資料未寫入
+
+可能原因：
+- 佇列已滿（目前策略為丟棄最舊資料，保留最新事件）
+- 單筆資料連續重試失敗後被丟棄
+
+排除方式：
+- 改善 WiFi 品質，降低上傳失敗率
+- 依需求調大佇列容量與重試次數（需修改程式常數）
+
 ## 9. 安全性建議（可選）
 
 目前設定是最小可用版本，建議後續加強：
@@ -231,6 +250,7 @@ function doPost(e) {
 3. `302`：先確認是最新版韌體 + `/exec` URL。
 4. `403`：檢查 Web App 權限是否為「知道連結的任何人」。
 5. `500`：進 Apps Script「執行作業」查看堆疊，優先檢查 `SPREADSHEET_ID` / `SHEET_NAME`。
+6. 若出現 `302 -> 200`，屬正常轉址後成功，不需額外處理。
 
 ---
 

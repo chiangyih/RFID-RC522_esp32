@@ -11,6 +11,8 @@
 5. 開機後自動連接 WiFi，並進行 NTP 時間同步。
 6. 每次讀卡流程為「先更新 OLED，再上傳 Google Sheet」。
 7. 上傳欄位為 datetime、uid_raw、uid_big_endian；datetime 格式為 yyyy/mm/dd hh:mm:ss。
+8. 上傳採背景佇列處理，讀卡主流程不會被網路請求阻塞。
+9. 內建上傳重試與去抖動機制，提升大量刷卡與網路抖動下的穩定性。
 
 ---
 
@@ -108,6 +110,12 @@ UID DEC:(Big Endian) 2751234395
 Sheet upload HTTP code: 200
 ```
 
+若有轉址流程，會顯示 initial 與 follow 狀態碼：
+
+```text
+Sheet upload HTTP code: 302 -> 200
+```
+
 非 2xx 時會再顯示伺服器回應片段，方便除錯。
 
 ---
@@ -129,6 +137,13 @@ Sheet upload HTTP code: 200
 HEX 字串：每個 byte 轉為兩位大寫十六進制，byte 間用空白分隔。
 DEC 字串：以大整數十進制位數陣列運算，支援 10-byte UID。
 
+4. 上傳佇列層
+讀卡流程只負責 enqueue，背景再逐筆送出到 Google Sheet。
+特色：
+- 佇列滿時丟棄最舊資料，優先保留新刷卡事件。
+- 單筆上傳失敗可重試（預設 2 次）。
+- 可分辨 30x 轉址前後狀態碼（例如 302 -> 200）。
+
 ### 主流程 (setup 與 loop)
 
 ```mermaid
@@ -147,10 +162,14 @@ flowchart TD
 	J -- 是 --> K[UID 轉 HEX 與 DEC]
 	K --> L[輸出到 Serial]
 	L --> M[顯示到 OLED]
-	M --> N[上傳到 Google Sheet]
+	M --> N[事件入上傳佇列]
 	N --> O[HaltA]
 	O --> P[StopCrypto1]
 	P --> I
+
+	I --> Q[背景處理上傳佇列]
+	Q --> R[上傳到 Google Sheet]
+	R --> I
 ```
 
 ### DEC(Big Endian) 演算法
@@ -227,6 +246,29 @@ pio device monitor --baud 115200
 4. DEC 轉換已支援 10-byte UID；若未來改用更長 UID，需同步放大位數與緩衝區。
 5. Google Sheet 上傳網址與 WiFi 憑證存放於 include/secrets.h，且已被 .gitignore 排除。
 6. 如需顯示「Sheet redirect to」除錯訊息，可將 src/main.cpp 內的 SHEET_UPLOAD_DEBUG 改為 true。
+7. 同 UID 於短時間內會被去抖動（預設 350ms），可透過 UID_DEBOUNCE_MS 調整。
+
+---
+
+## 參數調校建議表
+
+下列參數都在主程式常數區，可依現場網路品質與刷卡頻率調整：
+
+| 參數 | 目前值 | 建議範圍 | 調大效果 | 調小效果 | 建議情境 |
+|---|---:|---:|---|---|---|
+| UPLOAD_QUEUE_CAPACITY | 8 | 4 ~ 32 | 可暫存更多待送資料，斷網時較不易丟資料 | RAM 使用較低，但高流量時較容易觸發丟棄最舊資料 | 刷卡頻率高或網路偶發不穩時可先調到 12 或 16 |
+| UPLOAD_MAX_RETRY | 2 | 0 ~ 5 | 暫時性網路波動下成功率提升 | 失敗可更快放棄，避免佇列卡住太久 | 網路穩定可維持 1~2；網路不穩可試 3 |
+| UPLOAD_RETRY_DELAY_MS | 1500 | 500 ~ 5000 | 降低重試壓力，較不會連續打爆伺服器 | 重試更積極，恢復速度快但可能造成網路壓力 | 若 AP 容易短暫斷線，建議 1500~3000 |
+| HTTP_CONNECT_TIMEOUT_MS | 1500 | 800 ~ 5000 | 可容忍較慢連線，誤判失敗較少 | 失敗回復更快，主系統反應較即時 | 內網穩定可 1000~1500；跨網路可 2500 |
+| HTTP_READ_TIMEOUT_MS | 2500 | 1000 ~ 8000 | 容忍慢回應，成功率提高 | 逾時更快，不會久等回應 | Apps Script 偶發慢回應可提高到 3000~5000 |
+| UID_DEBOUNCE_MS | 350 | 150 ~ 1500 | 重複感應抑制更強，減少重複上傳 | 反應更靈敏，但同卡停留時可能重複觸發 | 若卡片常停留感應區，可調到 500~800 |
+
+### 快速調校建議
+
+1. 刷卡快且常斷網：先調 `UPLOAD_QUEUE_CAPACITY = 16`、`UPLOAD_MAX_RETRY = 3`。
+2. 追求即時反應：先調 `HTTP_CONNECT_TIMEOUT_MS = 1000`、`HTTP_READ_TIMEOUT_MS = 1500`。
+3. 同卡重複觸發太多：先調 `UID_DEBOUNCE_MS = 600`。
+4. 若看到大量 `Sheet upload dropped after retries.`：優先提高 `UPLOAD_MAX_RETRY` 與 `UPLOAD_QUEUE_CAPACITY`，再檢查 WiFi 品質。
 
 ---
 
