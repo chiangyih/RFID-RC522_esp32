@@ -1,4 +1,5 @@
-# RFID RC522 UID 讀取專案
+# RFID RC522 UID 讀取
+## 分支-聯網並記錄於google drive
 
 本專案使用 ESP32 (NodeMCU-32S) 搭配 RC522 RFID 讀卡模組，讀取卡片 UID 後，同步輸出到 Serial 與 1.3 吋 SH1106 OLED。
 
