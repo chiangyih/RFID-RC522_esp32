@@ -2,7 +2,12 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <U8g2lib.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
 #include <stdio.h>
+#include "secrets.h"
 
 // ============================================================== 
 // 專案邏輯總覽
@@ -43,6 +48,14 @@ static const uint32_t SERIAL_BAUD   = 115200;
 static const size_t UID_HEX_BUF_LEN = 32;
 // 10-byte UID 十進制最大約 25 位數 + 字串結尾字元。
 static const size_t UID_DEC_BUF_LEN = 26;
+// Google Sheet 上傳 payload 緩衝區。
+static const size_t JSON_PAYLOAD_LEN = 192;
+// 上傳除錯輸出開關：true 顯示 redirect 與額外診斷，false 僅保留必要資訊。
+static const bool SHEET_UPLOAD_DEBUG = false;
+
+// NTP 設定（台灣時區 UTC+8）。
+static const long GMT_OFFSET_SEC = 8 * 3600;
+static const int DST_OFFSET_SEC  = 0;
 
 // ── 函式宣告 ────────────────────────────────────────────────
 // showWaiting()：顯示開機待機畫面。
@@ -51,8 +64,13 @@ static const size_t UID_DEC_BUF_LEN = 26;
 // uidToDecCString()：將 UID 視為 big-endian 無號整數轉十進制 C 字串。
 void showWaiting();
 void showUID(const char *hexStr, const char *decStr);
+void drawWiFiStatus();
 void uidToHexCString(const MFRC522::Uid &uid, char *out, size_t outSize);
 void uidToDecCString(const MFRC522::Uid &uid, char *out, size_t outSize);
+void connectWiFi();
+void syncTimeByNTP();
+void getCurrentDateTime(char *out, size_t outSize);
+void uploadUIDToSheet(const char *hexStr, const char *decStr);
 
 // ════════════════════════════════════════════════════════════
 void setup() {
@@ -71,10 +89,194 @@ void setup() {
     // 設定預設字型（後續會在不同區塊切換字型）。
     u8g2.setFont(u8g2_font_6x12_tf);
 
+    // 連線 WiFi
+    connectWiFi();
+
+    // 同步 NTP 時間，供 UID 上傳時附帶日期時間。
+    syncTimeByNTP();
+
     Serial.println("RFID Reader ready.");
 
     // 開機先顯示待機畫面，提示使用者可開始刷卡。
     showWaiting();
+}
+
+// ════════════════════════════════════════════════════════════
+// WiFi 連線
+// 嘗試連線至 secrets.h 中定義的 SSID，最多等待 10 秒。
+void connectWiFi() {
+    Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    const uint32_t timeout = 10000;
+    const uint32_t start   = millis();
+
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start >= timeout) {
+            Serial.println("WiFi connection timed out.");
+            return;
+        }
+        delay(500);
+        Serial.print('.');
+    }
+
+    Serial.println();
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+}
+
+// ────────────────────────────────────────────────────────────
+// NTP 同步（嘗試最多 8 秒），成功後可用 localtime() 取得本地時間。
+void syncTimeByNTP() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Skip NTP sync: WiFi not connected.");
+        return;
+    }
+
+    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
+
+    time_t now = 0;
+    const uint32_t start = millis();
+    while (now < 1700000000) {
+        now = time(nullptr);
+        if (millis() - start > 8000) {
+            Serial.println("NTP sync timed out.");
+            return;
+        }
+        delay(200);
+    }
+    Serial.println("NTP time synced.");
+}
+
+// ────────────────────────────────────────────────────────────
+// 產生日期時間字串（格式：yyyy/mm/dd hh:mm:ss）。
+void getCurrentDateTime(char *out, size_t outSize) {
+    if (outSize == 0) {
+        return;
+    }
+
+    time_t now = time(nullptr);
+    if (now < 1700000000) {
+        snprintf(out, outSize, "1970/01/01 00:00:00");
+        return;
+    }
+
+    struct tm localTm;
+    localtime_r(&now, &localTm);
+    strftime(out, outSize, "%Y/%m/%d %H:%M:%S", &localTm);
+}
+
+// ────────────────────────────────────────────────────────────
+// 每次讀到 UID 後發送到 Google Apps Script Webhook。
+// 欄位：datetime、uid_raw、uid_big_endian。
+void uploadUIDToSheet(const char *hexStr, const char *decStr) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Sheet upload skipped: WiFi disconnected.");
+        return;
+    }
+
+    if (strlen(SHEET_WEBHOOK_URL) == 0 || strstr(SHEET_WEBHOOK_URL, "replace-me") != nullptr) {
+        Serial.println("Sheet upload skipped: SHEET_WEBHOOK_URL not configured.");
+        return;
+    }
+
+    char dateTimeStr[32];
+    getCurrentDateTime(dateTimeStr, sizeof(dateTimeStr));
+
+    char payload[JSON_PAYLOAD_LEN];
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"datetime\":\"%s\",\"uid_raw\":\"%s\",\"uid_big_endian\":\"%s\"}",
+        dateTimeStr,
+        hexStr,
+        decStr
+    );
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    if (!http.begin(client, SHEET_WEBHOOK_URL)) {
+        Serial.println("Sheet upload failed: begin() failed.");
+        return;
+    }
+
+    // Google Apps Script 可能回傳 30x。
+    // 301/302/303 依慣例改用 GET；307/308 才保留原方法（POST）。
+    const char *headerKeys[] = {"Location"};
+    http.collectHeaders(headerKeys, 1);
+
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(reinterpret_cast<uint8_t *>(payload), strlen(payload));
+
+    if (httpCode == 301 || httpCode == 302 || httpCode == 303 || httpCode == 307 || httpCode == 308) {
+        String redirectUrl = http.header("Location");
+        if (SHEET_UPLOAD_DEBUG) {
+            Serial.print("Sheet redirect to: ");
+            Serial.println(redirectUrl);
+        }
+
+        http.end();
+
+        if (redirectUrl.length() > 0) {
+            WiFiClientSecure redirectedClient;
+            redirectedClient.setInsecure();
+
+            HTTPClient redirectedHttp;
+            if (!redirectedHttp.begin(redirectedClient, redirectUrl)) {
+                Serial.println("Sheet upload failed: redirect begin() failed.");
+                return;
+            }
+
+            if (httpCode == 307 || httpCode == 308) {
+                redirectedHttp.addHeader("Content-Type", "application/json");
+                httpCode = redirectedHttp.POST(reinterpret_cast<uint8_t *>(payload), strlen(payload));
+            } else {
+                httpCode = redirectedHttp.GET();
+            }
+
+            if (httpCode > 0) {
+                Serial.print("Sheet upload HTTP code: ");
+                Serial.println(httpCode);
+                if (httpCode < 200 || httpCode >= 300) {
+                    String response = redirectedHttp.getString();
+                    response.replace('\n', ' ');
+                    if (response.length() > 180) {
+                        response = response.substring(0, 180) + "...";
+                    }
+                    Serial.print("Sheet upload response: ");
+                    Serial.println(response);
+                }
+            } else {
+                Serial.print("Sheet upload failed: ");
+                Serial.println(redirectedHttp.errorToString(httpCode));
+            }
+
+            redirectedHttp.end();
+            return;
+        }
+    }
+
+    if (httpCode > 0) {
+        Serial.print("Sheet upload HTTP code: ");
+        Serial.println(httpCode);
+        if (httpCode < 200 || httpCode >= 300) {
+            String response = http.getString();
+            response.replace('\n', ' ');
+            if (response.length() > 180) {
+                response = response.substring(0, 180) + "...";
+            }
+            Serial.print("Sheet upload response: ");
+            Serial.println(response);
+        }
+    } else {
+        Serial.print("Sheet upload failed: ");
+        Serial.println(http.errorToString(httpCode));
+    }
+
+    http.end();
 }
 
 // ════════════════════════════════════════════════════════════
@@ -103,6 +305,9 @@ void loop() {
     // showUID() 內部會先 clearBuffer()，因此每次新卡都會覆蓋舊資訊。
     showUID(hexStr, decStr);
 
+    // 將每一筆 UID 讀取結果上傳至 Google Sheet。
+    uploadUIDToSheet(hexStr, decStr);
+
     // 讓目前卡片進入 Halt，結束本次交易流程，避免重複觸發。
     rfid.PICC_HaltA();
 
@@ -125,6 +330,9 @@ void showWaiting() {
     // 顯示待機提示。
     u8g2.setFont(u8g2_font_6x12_tf);
     u8g2.drawStr(20, 42, "Waiting...");
+
+    // 右上角第一行顯示 WiFi 狀態。
+    drawWiFiStatus();
 
     // 將緩衝區一次送出到 OLED。
     u8g2.sendBuffer();
@@ -159,8 +367,35 @@ void showUID(const char *hexStr, const char *decStr) {
     u8g2.setFont(u8g2_font_5x7_tf);
     u8g2.drawStr(0, 62, "Wait another card:...");
 
+    // 右上角第一行顯示 WiFi 狀態。
+    drawWiFiStatus();
+
     // 完成所有繪圖後再一次更新螢幕，避免閃爍。
     u8g2.sendBuffer();
+}
+
+// ────────────────────────────────────────────────────────────
+// 在 OLED 右上角第一行（y=7）繪製 WiFi 連線狀態。
+// 已連線：「wifi:<IP>」；未連線：「wifi:failure」。
+// 使用 getStrWidth() 動態右對齊，不依賴固定像素寬度。
+void drawWiFiStatus() {
+    u8g2.setFont(u8g2_font_5x7_tf);
+
+    char label[32];
+    if (WiFi.status() == WL_CONNECTED) {
+        // 取得 IP 字串（格式如 192.168.1.100）
+        IPAddress ip = WiFi.localIP();
+        snprintf(label, sizeof(label), "WiFi:%d.%d.%d.%d",
+                 ip[0], ip[1], ip[2], ip[3]);
+    } else {
+        snprintf(label, sizeof(label), "WiFi:failure");
+    }
+
+    int16_t x = static_cast<int16_t>(128 - u8g2.getStrWidth(label));
+    if (x < 0) {
+        x = 0;
+    }
+    u8g2.drawStr(x, 7, label);
 }
 
 // ────────────────────────────────────────────────────────────

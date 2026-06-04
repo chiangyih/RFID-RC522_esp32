@@ -8,6 +8,9 @@
 2. 卡片拿開後畫面保留，不會自動清空。
 3. 感應到下一張卡片時，才更新畫面內容。
 4. DEC 轉換支援 10-byte UID，不會因 64 位整數上限而溢位。
+5. 開機後自動連接 WiFi，並進行 NTP 時間同步。
+6. 每次讀卡流程為「先更新 OLED，再上傳 Google Sheet」。
+7. 上傳欄位為 datetime、uid_raw、uid_big_endian；datetime 格式為 yyyy/mm/dd hh:mm:ss。
 
 ---
 
@@ -99,6 +102,14 @@ UID HEX: A3 F2 01 5B
 UID DEC:(Big Endian) 2751234395
 ```
 
+若啟用雲端上傳，會額外顯示：
+
+```text
+Sheet upload HTTP code: 200
+```
+
+非 2xx 時會再顯示伺服器回應片段，方便除錯。
+
 ---
 
 ## 詳細程式架構與邏輯說明
@@ -126,17 +137,20 @@ flowchart TD
 	B --> C[初始化 SPI]
 	C --> D[初始化 RC522]
 	D --> E[初始化 OLED]
-	E --> F[顯示 Waiting]
-	F --> G[進入 loop]
+	E --> F[連線 WiFi]
+	F --> G[NTP 同步]
+	G --> H[顯示 Waiting]
+	H --> I[進入 loop]
 
-	G --> H{有新卡且讀卡成功?}
-	H -- 否 --> G
-	H -- 是 --> I[UID 轉 HEX 與 DEC]
-	I --> J[輸出到 Serial]
-	J --> K[顯示到 OLED]
-	K --> L[HaltA]
-	L --> M[StopCrypto1]
-	M --> G
+	I --> J{有新卡且讀卡成功?}
+	J -- 否 --> I
+	J -- 是 --> K[UID 轉 HEX 與 DEC]
+	K --> L[輸出到 Serial]
+	L --> M[顯示到 OLED]
+	M --> N[上傳到 Google Sheet]
+	N --> O[HaltA]
+	O --> P[StopCrypto1]
+	P --> I
 ```
 
 ### DEC(Big Endian) 演算法
@@ -179,6 +193,7 @@ $$
 |---|---|---|
 | MFRC522 | miguelbalboa/MFRC522 | RC522 RFID 驅動 |
 | U8g2 | olikraus/U8g2 | SH1106 OLED 驅動 |
+| WiFi / WiFiClientSecure / HTTPClient | framework-arduinoespressif32 內建 | WiFi 連線與 HTTPS 上傳 |
 
 ---
 
@@ -210,6 +225,8 @@ pio device monitor --baud 115200
 2. 若 OLED 無顯示，請先檢查 I2C 位址 (0x3C/0x3D)。
 3. 本專案顯示策略為資料保留式，不會在讀卡後自動回待機。
 4. DEC 轉換已支援 10-byte UID；若未來改用更長 UID，需同步放大位數與緩衝區。
+5. Google Sheet 上傳網址與 WiFi 憑證存放於 include/secrets.h，且已被 .gitignore 排除。
+6. 如需顯示「Sheet redirect to」除錯訊息，可將 src/main.cpp 內的 SHEET_UPLOAD_DEBUG 改為 true。
 
 ---
 
@@ -219,6 +236,8 @@ pio device monitor --baud 115200
 RFID-RC522_esp32/
 ├── src/
 │   └── main.cpp           # 主程式 (讀卡、轉換、顯示)
+│
+├── GOOGLE_SHEET_WEBHOOK_SETUP.md # Google Sheet Webhook 詳細設定手冊
 ├── include/
 │   └── README             # 標頭檔放置說明
 ├── lib/

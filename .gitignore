@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# WiFi 憑證（含密碼），不可上傳至版本庫
+include/secrets.h
